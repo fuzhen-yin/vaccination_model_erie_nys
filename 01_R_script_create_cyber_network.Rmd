@@ -1,0 +1,425 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+
+```{r}
+# Basic Packages
+library(sp) # Classes and Methods for Spatial Data.
+library(rgdal)  # for vector work; sp package should always load with rgdal. ]
+library(sf) # Simple Features for R, st_as_sf
+library (raster)   # for metadata/attributes- vectors or rasters
+library(dplyr)    # mutate, left_join
+library(tidyverse) # tidy data 
+library(data.table) # setnames
+library(plyr)
+library(igraph) # network analysis
+library(tmap)
+library(spatstat) # analysis of spatial point patterns,  ‘ppp’ (point pattern) object
+library(maptools) # coerce SpatialPolygons into an ‘owin: observ window’ object
+library(spdep) # local moran's I, nb2listw, 
+library(rgeos)
+library(magrittr)  # %>%
+library(reshape2)  # dcast, cast category variables to 1/0
+# STATISTIC
+library(limSolve) # https://search.r-project.org/CRAN/refmans/limSolve/html/lsei.html 
+library(GGally)       #correlation diagram  
+# PLT
+library(ggplot2)
+library(corrplot)
+library(htmlwidgets)
+library(shinyjs)
+library(contoureR)
+library(geometry)
+library(tmaptools)
+library(RColorBrewer) # for color selection
+library(hrbrthemes) # theme
+library(ggbreak)     # break x/y axis     
+library(ggpubr)
+library(viridis)
+
+# NETWORK 
+library(igraph)
+```
+
+# Data
+Projection: NAD83 / UTM zone 18N  [EPSG:26918]
+## Synthetic Pop & Network
+```{r}
+# set random seed
+rm_seed <- 116
+
+# read in individual data
+tt <- read.csv("data/0621_Na/Erie_pop_urban.csv") %>% select(-X)
+tt[tt$urban=="True",]$urban <- "is_urban"
+tt[tt$urban=="0",]$urban <- "is_rural"
+df_ind <- tt
+
+# read in network dataset 
+df <- data.frame(matrix(ncol = 4)) %>% setnames(c("Source","Target","Type","Relation"))
+
+lt <- c("hhold","daycare","school","work")
+for (item in lt) {
+  path <- sprintf("data/0621_Na/networks/%s_nw.csv", item)
+  tt <- read.csv(path, header = F) 
+  ttt <- tt %>% pivot_longer(cols = 2:length(tt), names_to = "key", values_to ="Target") %>% 
+    select(-key) %>% setnames(., old="V1", new="Source") %>% filter(Target !="") %>% 
+    mutate(Type="Undirected", Relation=as.character(item))
+  
+  df <- rbind(df, ttt)
+}
+
+df <- na.omit(df)
+df_ntwk <- df
+```
+## Spatial data
+```{r}
+# Erie County
+path <- paste(dirname(dirname(dirname(getwd()))),"/zz_NYS_GIS_Data/tl_2021_us_county/tl_2021_us_county.shp", sep="")
+sf_nys_county <- st_read(path) %>% filter(STATEFP=="36") %>% st_transform(crs = 26918)
+sf_erie <- st_read(path) %>% filter(STATEFP=="36" & NAME=="Erie") %>% st_transform(crs = 26918)
+
+# Census Tracts 
+path <- paste(dirname(dirname(dirname(getwd()))),"/zz_NYS_GIS_Data/tl_2021_36_tract/tl_2021_36_tract.shp", sep="")
+sf_tract <- st_read(path) %>% filter(COUNTYFP=="029") %>% st_transform(crs = 26918)
+
+# Urban Area Cores 
+path <- paste(dirname(dirname(dirname(getwd()))),"/zz_NYS_GIS_Data/tl_2020_us_uac10/tl_2020_us_uac10.shp", sep="")
+tt <- st_read(path) %>% st_transform(crs = 26918)
+tt <- tt[lengths(st_intersects(tt, sf_erie))>0, ]
+sf_uac <- tt
+```
+# Study Area
+```{r}
+tmap_mode("plot")
+
+# Erie in NYS
+pdf("plot/11_study_area_nys_erie.pdf")
+tm_shape(sf_nys_county) + tm_polygons(alpha = 0, lwd = 0.5) + 
+  tm_shape(sf_erie) + tm_polygons(col="blue", alpha = 0.5, lwd = 2) + 
+  tm_compass(north = 0, position = c("left", "bottom")) + tm_scale_bar(position = c("left", "bottom"), width = 0.1)+
+  tm_layout(frame = FALSE)
+dev.off()
+
+
+# Tracts in Erie
+pdf("plot/11_study_area_erie.pdf")
+tm_shape(sf_erie) + tm_polygons(alpha = 0, lwd = 2) + 
+  tm_shape(sf_tract) + tm_polygons(alpha = 0, lwd = 0.5) + 
+  tm_shape(sf_uac) + tm_polygons(col = "blue", alpha=0.5, border.alpha = 0) + 
+  tm_compass(north = 0, position = c("left", "bottom")) + tm_scale_bar(position = c("left", "bottom"), width = 0.15)+
+  tm_layout(frame = FALSE)
+dev.off()
+```
+
+
+# Social media network 
+## ADULT
+### lsei optimization
+age: [18. +inf.]
+```{r}
+# Data source: Pew research report: https://www.pewresearch.org/internet/2021/04/07/social-media-use-in-2021/
+# total: 69%
+# Identify social media users;    urban (70%), rural (67%); 
+#                       male (61%); female (77%); 
+#                       age 18-29 (70%); age 30-49 (77%); age 50-64 (73%); age 60+ (50%)
+
+# (lsei) Least Squares with Equalities and Inequalities
+# min( ||Ax-b||**2 ) 
+# subject to         Ex =f         &           Gx <= h
+
+
+# individual level 
+tt <- df_ind[ c("id","age","sex","urban")] %>% filter(age >=18) %>% mutate(n=1)
+brks <- c(17,29,49,64,100)
+labs <- c("age_18_29","age_30_49","age_50_64","age_65over")
+tt$age_cat <- cut(tt$age, breaks=brks, labels = labs)
+
+
+# LEFT SIDE (E): diff. demographic groups 
+foo <- aggregate(n~age_cat + sex + urban, data =tt[c("age_cat","sex","urban","n")], FUN=sum) %>% 
+  arrange(age_cat, sex, urban) %>% 
+  mutate(demo_type = sprintf("dem_adult_g%02d", 1:nrow(.)))
+
+# one-hot coding, variable by variable 
+for (var in c("age_cat","sex", "urban")) {
+  xx <- foo[c(var, "n", "demo_type")] %>% setnames(new=c("var","n", "demo_type"))
+  # one-hot coding 
+  xx <- dcast(xx, demo_type ~ var, fill = 0, value.var = "n")
+  foo <- left_join(foo, xx, by=c("demo_type"))
+}
+
+m1 <- foo[,6:13] %>% as.matrix() %>% t()
+
+
+# RIGHT SIDE (f): 
+zz <- apply(foo[,6:13], 2, sum) 
+zzz <- matrix(c(0.7, 0.77, 0.73, 0.5, 0.77, 0.61, 0.67, 0.7))     # Facebook
+m2 <- zz * zzz
+
+# Inequality constraints, Gx >= H
+m3 <-  rbind(diag(16),-1 * diag(16))
+m4 <- rbind(matrix(0, nrow = 16), as.matrix(foo$n) * -1)
+
+# Resolve
+a <- lsei(E = m1, F = m2, G=m3, H=m4)
+foo["p_sm_user"] <- a$X
+foo["n_sm_user"] <- round(foo$n * a$X, 0)
+
+
+# check result 
+(m1 %*% a$X) / zz
+(m1 %*% a$X - m2)
+(m1 %*% a$X - m2) / m2
+
+df_smedia_adult_g <- foo
+```
+### Selection in each group
+```{r}
+set.seed(rm_seed)
+
+# tt # individual data with age category 
+data <- df_ind %>% mutate(if_smedia = "no")
+df <- df_smedia_adult_g      # count of smedia user in each demographic group 
+
+for (i in 1:nrow(df)) {
+  xx <- tt %>% filter(age_cat == df$age_cat[[i]] & 
+                        sex == df$sex[[i]] & 
+                        urban == df$urban[[i]]) %>% slice_sample( n = df$n_sm_user[[i]]) %>% pull(id)
+  data[data$id %in% xx, ]$if_smedia <- "is_adult_smedia_user"
+}
+
+df_ind_smedia <- data
+```
+
+## TEEN 
+age: [13, 17]
+### lsei optimization
+```{r}
+# Data source: Pew research report: https://www.pewresearch.org/internet/2022/08/10/teens-social-media-and-technology-2022/
+# Teen FB Users: total (59%)
+#                urban (40%), rural (43%)
+#                boy (31%), girl (34%)
+#                age 13-14 (23%), age 15-17 (39%)
+
+# (lsei) Least Squares with Equalities and Inequalities
+# min( ||Ax-b||**2 ) 
+# subject to         Ex =f         &           Gx <= h
+
+
+# individual level 
+tt <- df_ind[ c("id","age","sex","urban")] %>% filter(age >=13 & age <=17) %>% mutate(n=1)
+brks <- c(12,14,18)
+labs <- c("age_13_14","age_15_17")
+tt$age_cat <- cut(tt$age, breaks=brks, labels = labs)
+
+
+# LEFT SIDE (E): diff. demographic groups 
+foo <- aggregate(n~age_cat + sex + urban, data =tt[c("age_cat","sex","urban","n")], FUN=sum) %>% 
+  arrange(age_cat, sex, urban) %>% 
+  mutate(demo_type = sprintf("dem_teen_g%02d", 1:nrow(.)))
+
+# one-hot coding, variable by variable 
+for (var in c("age_cat","sex", "urban")) {
+  xx <- foo[c(var, "n", "demo_type")] %>% setnames(new=c("var","n", "demo_type"))
+  # one-hot coding 
+  xx <- dcast(xx, demo_type ~ var, fill = 0, value.var = "n")
+  foo <- left_join(foo, xx, by=c("demo_type"))
+}
+
+m1 <- foo[,6:11] %>% as.matrix() %>% t()
+
+
+# RIGHT SIDE (f): 
+zz <- apply(foo[,6:11], 2, sum) 
+# zzz <- matrix(c(0.23, 0.39, 0.34, 0.31, 0.43, 0.40))         # Facebook DON'T USE
+zzz <- matrix(c(0.51, 0.65, 0.64, 0.54, 0.62, 0.58))         # Snapchat
+m2 <- zz * zzz
+
+# Inequality constraints, Gx >= H
+m3 <-  rbind(diag(8),-1 * diag(8))
+m4 <- rbind(matrix(0, nrow = 8), as.matrix(foo$n) * -1)
+
+# Resolve
+a <- lsei(E = m1, F = m2, G=m3, H=m4)
+foo["p_sm_user"] <- a$X
+foo["n_sm_user"] <- round(foo$n * a$X, 0)
+
+
+# check result 
+(m1 %*% a$X) / zz
+(m1 %*% a$X - m2)
+(m1 %*% a$X - m2) / m2
+
+df_smedia_teen_g <- foo
+```
+### Selection in each group
+```{r}
+set.seed(rm_seed)
+
+# tt # individual data with age category 
+data <- df_ind_smedia
+df <- df_smedia_teen_g      # count of smedia user in each demographic group 
+
+for (i in 1:nrow(df)) {
+  xx <- tt %>% filter(age_cat == df$age_cat[[i]] & 
+                        sex == df$sex[[i]] & 
+                        urban == df$urban[[i]]) %>% slice_sample( n = df$n_sm_user[[i]]) %>% pull(id)
+  data[data$id %in% xx, ]$if_smedia <- "is_teen_smedia_user"
+}
+
+df_ind_smedia_finl <- data
+
+# # export 
+# write.csv(df_ind_smedia_finl, "data/20230717_ind_identify_social_media_user_adult_teen.csv", row.names = F)
+```
+
+## Cyber Network (social media)
+### Adult [18, inf.)
+```{r}
+set.seed(rm_seed)
+
+# Filter adults using social media
+data <- df_ind_smedia_finl %>% filter(if_smedia=="is_adult_smedia_user") %>%     # individual, add randomness
+  select(id) %>% sample() %>%                                                        
+  mutate(Source = rownames(.), Target=rownames(.))
+data[c("Source","Target")]<- sapply(data[c("Source","Target")], as.numeric) %>% as.data.frame()
+n <- nrow(data)
+
+# Scale free social media network. avg = 50 (50% of users living within 50 miles)
+# Generate Network 
+g <- sample_pa(n, m = 25, directed =F, power = 1)
+mean(degree(g))
+
+g_df <- as.data.frame(get.edgelist(g))   #m:number of edges to add in each time step
+g_df <- left_join(g_df, data[c("id","Source")], by=c("V1"="Source")) %>% setnames(old="id", new="Source")
+g_df <- left_join(g_df, data[c("id","Target")], by=c("V2"="Target")) %>% setnames(old="id", new="Target")
+g_df$Type = "Undirected"
+g_df$Relation = "SocialMedia"
+
+ntwk_sm_adult <- g_df[c("Source","Target","Type","Relation")]
+
+# # export
+# write.csv(ntwk_sm_adult, "data/20230717_ntwk_social_media_ADULT_avg_degree_50.csv", row.names = F)
+```
+### Teen [13,17]
+```{r}
+set.seed(rm_seed)
+
+# Filter adults using social media
+data <- df_ind_smedia_finl %>% filter(if_smedia=="is_teen_smedia_user") %>%     # individual, add randomness
+  select(id) %>% sample() %>%                                                        
+  mutate(Source = rownames(.), Target=rownames(.))
+data[c("Source","Target")]<- sapply(data[c("Source","Target")], as.numeric) %>% as.data.frame()
+n <- nrow(data)
+
+# Scale free social media network. avg = 50 (50% of users living within 50 miles)
+# Generate Network 
+g <- sample_pa(n, m = 25, directed =F, power = 1)
+mean(degree(g))
+
+g_df <- as.data.frame(get.edgelist(g))   #m:number of edges to add in each time step
+g_df <- left_join(g_df, data[c("id","Source")], by=c("V1"="Source")) %>% setnames(old="id", new="Source")
+g_df <- left_join(g_df, data[c("id","Target")], by=c("V2"="Target")) %>% setnames(old="id", new="Target")
+g_df$Type = "Undirected"
+g_df$Relation = "SocialMedia"
+
+ntwk_sm_teen <- g_df[c("Source","Target","Type","Relation")]
+ntwk_sm_all_adult_and_teen <- rbind(ntwk_sm_adult, ntwk_sm_teen)
+
+
+# # export
+# write.csv(ntwk_sm_teen, "data/20230717_ntwk_social_media_TEEN_avg_degree_50.csv", row.names = F)
+# write.csv(ntwk_sm_all_adult_and_teen, "data/20230717_ntwk_00_social_media_ALL.csv", row.names = F)
+```
+# Export
+## Ind: projection 
+Projection: NAD83 / UTM zone 18N  [EPSG:26918]
+```{r}
+tt <- list()
+
+data <- df_ind_smedia_finl %>% select(-geometry) %>% st_as_sf(., coords = c("long","lat"), crs=4326)
+# project to:crs=26918
+data <- st_transform(data, crs=26918)
+data <- data %>% mutate(long = unlist(map(data$geometry,1)), lat = unlist(map(data$geometry,2)))
+
+# Add randomness to centroid
+aa <- 5  # NAD 83
+data$long <- data$long + runif(nrow(data), -aa, aa)
+data$lat <- data$lat+ runif(nrow(data), -aa, aa)
+
+# remove geometry & assigne a new numeric id 
+data <- data %>% st_drop_geometry() %>% mutate(ind_new_id = as.numeric(rownames(.))-1)
+
+tt[["finl_ind"]] <- data
+lt_to_exprt <- tt
+
+
+# tmap_mode("plot")
+# tmap_mode("view")
+ 
+# tt <- data %>% st_drop_geometry()
+# tt <- tt %>% st_as_sf(., coords = c("long","lat"), crs=26918)
+
+# pdf("plot/xx_ind.pdf")
+# tm_shape(tt %>% filter(hhold=="36029000110h1012")) + tm_dots(col="red")
+# dev.off()
+```
+
+## Network: all 
+```{r}
+data <- lt_to_exprt[["finl_ind"]]
+
+# aggregate network of different spaces together 
+tt <- df_ntwk
+tt <- rbind(df_ntwk, ntwk_sm_all_adult_and_teen)
+# assign new id
+tt <- left_join(tt, data[c("id","ind_new_id")], by=c("Source"="id")) %>% setnames(., old="ind_new_id", new="source_reindex")
+tt <- left_join(tt, data[c("id","ind_new_id")], by=c("Target"="id")) %>% setnames(., old="ind_new_id", new="target_reindex")
+
+lt_to_exprt[["finl_ntwk"]] <- tt
+```
+
+## Export 
+```{r}
+for (item in names(lt_to_exprt)) {
+  xx <- lt_to_exprt[[as.character(item)]]
+  write.csv(xx, sprintf("data/xx_%s.csv", item), row.names = F)
+}
+```
+
+## Gephi - export
+```{r}
+set.seed(100)
+
+# nodes 
+data <- lt_to_exprt[["finl_ind"]] %>% select(id, age, sex, hhold, urban, if_smedia)
+data <- left_join(data, df_ind[c("id","lat","long")])
+
+# add randomness to node 
+aa <- 0.001 # wgs 84
+data$long <- data$long + runif(nrow(data), -aa, aa)
+data$lat <- data$lat+ runif(nrow(data), -aa, aa)
+
+# randomly select only 10%
+n= round(0.1 * nrow(data), 0)
+data <- data %>% slice_sample(n=n)
+
+# prepare edge files 
+df <- lt_to_exprt[["finl_ntwk"]] %>% select(Source,Target,Type,Relation) %>% filter((Source %in% data$id) & (Target %in% data$id) )
+
+
+write.csv(data, "data/02_gephi_ntwk/xx_ntwk_nodes_wgs84_randomness_0.001_10pct.csv", row.names = F)
+write.csv(df, "data/02_gephi_ntwk/xx_ntwk_edges.csv", row.names = F)
+```
+
+# Network Plot
+```{r}
+
+```
+
+
+
+
